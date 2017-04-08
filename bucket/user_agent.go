@@ -6,10 +6,10 @@ import (
 	"io"
 	"net/http"
 	"sort"
-	"sync"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
+	"github.com/mateusz/tempomat/lib/config"
 )
 
 type UserAgent struct {
@@ -21,7 +21,6 @@ func NewUserAgent(rate float64, hashMaxLen int) *UserAgent {
 	b := &UserAgent{
 		Bucket: Bucket{
 			rate:       rate,
-			mutex:      sync.RWMutex{},
 			hashMaxLen: hashMaxLen,
 		},
 		hash: make(map[string]entryUserAgent),
@@ -30,15 +29,24 @@ func NewUserAgent(rate float64, hashMaxLen int) *UserAgent {
 	return b
 }
 
-type entryUserAgent struct {
-	UA     string
-	Credit float64
+func (b *UserAgent) Title() string {
+	return "UserAgent"
 }
 
-func (b *UserAgent) SetHashMaxLen(hashMaxLen int) {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
-	b.hashMaxLen = hashMaxLen
+func (b *UserAgent) SetConfig(c config.Config) {
+	// should be protected from race conditions?
+	b.rate = c.UserAgentShare
+	b.Bucket.SetConfig(c)
+}
+
+func (b *UserAgent) Entries() map[string]Entry {
+	b.RLock()
+	entries := make(map[string]Entry)
+	for k, c := range b.hash {
+		entries[k] = c
+	}
+	b.RUnlock()
+	return entries
 }
 
 func (b *UserAgent) Register(r *http.Request, cost float64) {
@@ -48,46 +56,26 @@ func (b *UserAgent) Register(r *http.Request, cost float64) {
 	io.WriteString(hash, ua)
 	key := fmt.Sprintf("%x", hash.Sum(nil))
 
-	b.mutex.Lock()
+	b.Lock()
+	// subtract the credits since this it's already in ther
 	if c, ok := b.hash[key]; ok {
-		c.Credit -= cost
+		c.credit -= cost
 		b.hash[key] = c
+		// new entry, give it full credits - 1
 	} else {
 		b.hash[key] = entryUserAgent{
-			UA:     ua,
-			Credit: b.rate*10.0 - cost,
+			userAgent: ua,
+			credit:    b.rate*10.0 - cost,
 		}
 	}
 
-	log.Info(fmt.Sprintf("UserAgent: %s, %f billed to '%s', total is %f", r.URL, cost, ua, b.hash[key].Credit))
-	b.mutex.Unlock()
-}
-
-func (b *UserAgent) Dump(l *log.Logger) {
-	b.mutex.RLock()
-	defer b.mutex.RUnlock()
-	for k, c := range b.hash {
-		if c.Credit <= (b.rate * 10.0 * b.lowCreditThreshold) {
-			l.Info(fmt.Sprintf("UserAgent,%s,'%s',%.3f", k, c.UA, c.Credit))
-		}
-	}
-}
-
-func (b *UserAgent) CountUnderThreshold() int {
-	var i int
-	b.mutex.RLock()
-	defer b.mutex.RUnlock()
-	for _, c := range b.hash {
-		if c.Credit <= (b.rate * 10.0 * b.lowCreditThreshold) {
-			i++
-		}
-	}
-	return i
+	log.Info(fmt.Sprintf("UserAgent: %s, %f billed to '%s', total is %f", r.URL, cost, ua, b.hash[key].credit))
+	b.Unlock()
 }
 
 func (b *UserAgent) DumpList() DumpList {
-	b.mutex.RLock()
-	defer b.mutex.RUnlock()
+	b.RLock()
+	defer b.RUnlock()
 	return b.dumpListNoLock()
 }
 
@@ -95,13 +83,14 @@ func (b *UserAgent) dumpListNoLock() DumpList {
 	l := make(DumpList, len(b.hash))
 	i := 0
 	for _, v := range b.hash {
-		e := DumpEntry{Title: v.UA, Credit: v.Credit}
+		e := DumpEntry{Title: v.userAgent, Credit: v.credit}
 		l[i] = e
 		i++
 	}
 	return l
 }
 
+// this operation is not concurrency-safe by itself
 func (b *UserAgent) truncate(truncatedSize int) {
 	newHash := make(map[string]entryUserAgent)
 
@@ -109,8 +98,8 @@ func (b *UserAgent) truncate(truncatedSize int) {
 	sort.Sort(CreditSortDumpList(dumpList))
 	for i := 0; i < truncatedSize; i++ {
 		newHash[dumpList[i].Hash] = entryUserAgent{
-			UA:     dumpList[i].Title,
-			Credit: dumpList[i].Credit,
+			userAgent: dumpList[i].Title,
+			credit:    dumpList[i].Credit,
 		}
 	}
 	b.hash = newHash
@@ -119,19 +108,34 @@ func (b *UserAgent) truncate(truncatedSize int) {
 func (b *UserAgent) ticker() {
 	ticker := time.NewTicker(time.Second)
 	for range ticker.C {
-		b.mutex.Lock()
-		if len(b.hash) > b.hashMaxLen {
-			b.truncate(b.hashMaxLen)
-		}
+		b.Lock()
 		for k, c := range b.hash {
-			if c.Credit+b.rate > b.rate*10.0 {
-				// Purge entries that are at their max credit.
+			// remove entries that are at their max credits
+			if c.credit+b.rate > b.rate*10.0 {
 				delete(b.hash, k)
+				// else we give them some credits
 			} else {
-				c.Credit += b.rate
+				c.credit += b.rate
 				b.hash[k] = c
 			}
 		}
-		b.mutex.Unlock()
+		// truncate some entries to not blow out the memory
+		if len(b.hash) > b.hashMaxLen {
+			b.truncate(b.hashMaxLen)
+		}
+		b.Unlock()
 	}
+}
+
+type entryUserAgent struct {
+	userAgent string
+	credit    float64
+}
+
+func (e entryUserAgent) Credits() float64 {
+	return e.credit
+}
+
+func (e entryUserAgent) String() string {
+	return fmt.Sprintf("%s,%.3f", e.userAgent, e.credit)
 }
